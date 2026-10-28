@@ -1057,6 +1057,18 @@ fn to_lowered(
         let zero = ops::splat(fb, uint_lanes(form), 0)?;
         return fb.binary(BinOp::INotEqual, x, zero);
     }
+    // x86Code: a `bool` builtin (`FrontFacing`) read into an integer form (an `i8` `bool`
+    // parameter, `plan::input_builtin`): 1 or 0.
+    if matches!(form.held, Held::Int { .. })
+        && matches!(
+            cx.plan.families.stage_io.objects.get(link.object),
+            Some(IoObject::Builtin { shape: Shape::Bool, .. })
+        )
+    {
+        let one = ops::splat(fb, form, 1)?;
+        let zero = ops::splat(fb, form, 0)?;
+        return fb.select(x, one, zero);
+    }
     let x = ops::mask(fb, form, x)?;
     narrow::round(fb, form, x)
 }

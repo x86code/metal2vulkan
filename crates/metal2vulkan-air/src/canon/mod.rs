@@ -51,7 +51,9 @@
 //!    stores** take their AIR 2.8 form, their extent, stride and origin built from the elements per
 //!    row, the origin and the constant transpose flag (`legacy_matrix`). **Global built-in
 //!    variables**: each `air.get_*` read of a program-scope built-in becomes a read of a built-in
-//!    parameter appended to the entry (`global_builtin`).
+//!    parameter appended to the entry (`global_builtin`). **Program-scope bindings** (MSL 3.2's
+//!    `!air.global_bindings`) became parameters before SCCP the same way: each load of a bound
+//!    global reads a parameter of the binding's role appended to the entry (`global_binding`).
 //! 10. **ABI resolution and pruning**: predicate-gated parameters and outputs that are off
 //!     disappear from the entry point, a read of an absent argument takes its absent value (the
 //!     null reference of a resource argument) or is refused, global-valued ABI integers become
@@ -77,6 +79,7 @@ mod erase;
 mod fc;
 mod fold;
 pub mod function_table;
+mod global_binding;
 mod global_builtin;
 mod inline;
 mod interface;
@@ -574,6 +577,10 @@ pub fn specialize_dynamic(
     // A kernel's simdgroup asynchronous copies complete when their calls return, shared by the
     // simdgroup's lanes, and each wait is a simdgroup barrier.
     let body = async_copy::expand(body, &mut parts, ep, m)?;
+    // MSL 3.2 program-scope bindings: each load of a bound global becomes a read of a parameter
+    // added to the entry, before SCCP sees the global's `undef` initializer.
+    let (body, global_bindings) =
+        global_binding::expand(body, &mut parts, func, abi, &ep.stage, m)?;
 
     // SCCP. The body it read is freed as soon as it has run.
     let solved = {
@@ -670,6 +677,8 @@ pub fn specialize_dynamic(
     }
     // The built-in parameters the global built-ins' reads became.
     ep.params.extend(global_builtins);
+    // The parameters the program-scope bindings' reads became.
+    ep.params.extend(global_bindings);
     // A table whose every use devirtualization rewrote is read as a buffer of words.
     let mut function_tables = BTreeSet::new();
     for p in &mut ep.params {

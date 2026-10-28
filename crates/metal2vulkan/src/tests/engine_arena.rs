@@ -1071,6 +1071,104 @@ fn a_select_of_threadgroup_globals_selects_their_offsets() {
     }
 }
 
+/// A `select` between two constant globals' addresses, then a dynamic byte load through it (Apple's
+/// PVRTC decoder in MTLSimDriver's default.metallib picks its modulation table so): both arms are
+/// blob addresses, which the select takes as their offsets.
+#[test]
+fn a_select_of_constant_globals_selects_their_blob_offsets() {
+    let globals = "@std = internal unnamed_addr addrspace(2) constant [4 x i8] c\"\\00\\03\\05\\08\", align 1\n\
+                   @pun = internal unnamed_addr addrspace(2) constant [4 x i8] c\"\\00\\04\\84\\08\", align 1";
+    let body = r#"  %odd = trunc i32 %t to i1
+  %tab = select i1 %odd, ptr addrspace(2) @std, ptr addrspace(2) @pun
+  %i = and i32 %t, 3
+  %q = getelementptr inbounds i8, ptr addrspace(2) %tab, i32 %i
+  %b = load i8, ptr addrspace(2) %q, align 1
+  %v0 = zext i8 %b to i32
+  %v1 = add i32 %t, 1"#;
+    let Some(bc) = assemble(
+        "blob_select",
+        &two_word_kernel("blob_select", globals, body),
+    ) else {
+        return;
+    };
+    let std_t = [0u32, 3, 5, 8];
+    let pun_t = [0u32, 4, 0x84, 8];
+    let want: Vec<u32> = (0..16u32)
+        .flat_map(|t| {
+            let v = if t % 2 == 1 { std_t } else { pun_t }[(t & 3) as usize];
+            [v, t + 1]
+        })
+        .collect();
+    for stem in PROFILES {
+        let prof = p(stem);
+        l3(&bc, "blob_select", &prof, stem);
+        let (plan, m) = typed_module(&bc, "blob_select", &prof).expect("module");
+        let b = plan
+            .families
+            .access
+            .blob
+            .as_ref()
+            .expect("the tables are in the blob");
+        let mut res = resources(&plan, 0, 32, 16, &[]);
+        let mut bytes = b.bytes.to_vec();
+        bytes.resize(bytes.len().next_multiple_of(16), 0);
+        res.buffers.push(Buffer {
+            slot: Some(ResourceSlot {
+                stage: Stage::Kernel,
+                kind: ResourceKind::Synthetic(SyntheticBinding::ConstantBlob),
+                index: 0,
+            }),
+            address: None,
+            bytes,
+        });
+        assert_eq!(run_both(&m, &res).expect("run"), want, "{stem}");
+    }
+}
+
+/// MSL 3.2 program-scope bindings (`constant uint* constant src [[buffer(1)]];`, Apple's
+/// `!air.global_bindings`, as MercuryPoster's wallpaper fragments bind their textures): each load
+/// of the bound global reads a parameter added to the entry, bound at the binding's index like an
+/// ordinary buffer argument; two globals of one binding (Apple duplicates one per translation unit)
+/// read the same parameter.
+#[test]
+fn a_program_scope_buffer_binding_reads_its_bound_buffer() {
+    let globals = r#"@src = internal unnamed_addr addrspace(2) externally_initialized constant ptr addrspace(2) undef, align 8
+@src.1 = internal unnamed_addr addrspace(2) externally_initialized constant ptr addrspace(2) undef, align 8
+!air.global_bindings = !{!10, !12}
+!10 = !{!"air.global_binding", ptr addrspace(2) @src, !11}
+!11 = !{i32 -1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"src"}
+!12 = !{!"air.global_binding", ptr addrspace(2) @src.1, !11}"#;
+    let body = r#"  %p = load ptr addrspace(2), ptr addrspace(2) @src, align 8
+  %q = getelementptr inbounds i32, ptr addrspace(2) %p, i32 %t
+  %v0 = load i32, ptr addrspace(2) %q, align 4
+  %p1 = load ptr addrspace(2), ptr addrspace(2) @src.1, align 8
+  %t1 = xor i32 %t, 1
+  %q1 = getelementptr inbounds i32, ptr addrspace(2) %p1, i32 %t1
+  %v1 = load i32, ptr addrspace(2) %q1, align 4"#;
+    let Some(bc) = assemble(
+        "global_binding",
+        &two_word_kernel("global_binding", globals, body),
+    ) else {
+        return;
+    };
+    let src: Vec<u32> = (0..16u32).map(|t| 1000 + 7 * t).collect();
+    let want: Vec<u32> = (0..16u32)
+        .flat_map(|t| [src[t as usize], src[(t ^ 1) as usize]])
+        .collect();
+    for stem in PROFILES {
+        let prof = p(stem);
+        l3(&bc, "global_binding", &prof, stem);
+        let (plan, m) = typed_module(&bc, "global_binding", &prof).expect("module");
+        let mut res = resources(&plan, 0, 32, 16, &[]);
+        res.buffers.push(Buffer {
+            slot: Some(out_slot(1)),
+            address: None,
+            bytes: src.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        });
+        assert_eq!(run_both(&m, &res).expect("run"), want, "{stem}");
+    }
+}
+
 /// Constant `getelementptr`s address their exact displacement from their global: into a threadgroup
 /// global placed before a second one (in the arena, where a byte read of its words keeps it),
 /// through a nested aggregate, with a negative index, and into a closed constant global in its

@@ -270,6 +270,9 @@ impl Leaf {
     }
 }
 
+/// x86Code: whether 16-byte leaves may use `uvec4` units (see `leaf_of`).
+const VEC4_UNITS: bool = false;
+
 /// The leaf of an access of AIR type `ty` with alignment `align` bytes (1 when unstated), or the
 /// refusal of a type that is not a scalar or vector the arithmetic family holds on `p`. A
 /// vector's lanes must be whole bytes (`<N x i1>` and odd widths are bit-packed in LLVM); one of
@@ -329,7 +332,12 @@ pub fn leaf_of(
     ) {
         return Err(not_lowered());
     }
-    let path = if bytes == 16 && align >= 16 {
+    // x86Code: no `uvec4` units. AIR's `align 16` promises a 16-aligned Metal address, but Apple GPUs
+    // load a 16-byte vector at any 4-aligned address and clients rely on it: MTLSimDriver's `astc`
+    // kernel reads `uint4` blocks from a buffer bound at a KTX mip's offset (4 mod 16), and the
+    // `uvec4` unit `(residual + m) / 16` dropped the residual's low bits (magenta wallpaper texture).
+    // Four aligned words read the same bytes at any 4-aligned offset.
+    let path = if bytes == 16 && align >= 16 && VEC4_UNITS {
         Path::Vec4
     } else if align >= 4 {
         Path::Aligned

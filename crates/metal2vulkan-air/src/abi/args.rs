@@ -18,7 +18,7 @@ use crate::bitcode::PointeeTable;
 use crate::budget::Meter;
 use crate::error::Error;
 use crate::error::{AbiError, DiagName};
-use crate::ir::{AddrSpace, FuncId, MdId, Module, Type, TypeId, TypeLayouts};
+use crate::ir::{AddrSpace, FuncId, GlobalId, MdId, Module, Type, TypeId, TypeLayouts};
 
 /// The decoder state shared by every node: the module, the meter, the layout arena, and the two
 /// tables that reach the IR type holding an argument buffer (see [`MemberSpace`]).
@@ -326,6 +326,40 @@ impl<'m> Cx<'m, '_> {
         }
         Ok(ParamBinding {
             param,
+            role,
+            unused: node.attrs.unused,
+            predicate: node.predicate,
+            ty: node.attrs.ty(),
+            name: node.attrs.name.clone(),
+        })
+    }
+
+    /// Decode the argument node of an MSL 3.2 program-scope binding of `global`: a parameter
+    /// node whose index is -1, whose pointer (a buffer's) is the global's value. The stage is
+    /// checked by the entry that reads it (`canon::global_binding`).
+    pub(super) fn global_binding(
+        &mut self,
+        id: MdId,
+        global: GlobalId,
+    ) -> Result<ParamBinding, Error> {
+        let node = self.node(id, Context::Input, &DiagName::new("air.global_binding"))?;
+        let pointer = self
+            .m
+            .global(global)
+            .and_then(|g| match self.m.types().get(g.value_ty) {
+                Some(Type::Ptr { space }) => Some(*space),
+                _ => None,
+            });
+        let layouts = node.layouts(|id, site| Structs::get(self, id, site, None))?;
+        let role = self.role(
+            &node,
+            layouts,
+            Context::Input,
+            pointer,
+            MemberSpace::Unstated,
+        )?;
+        Ok(ParamBinding {
+            param: node.index.unwrap_or(u32::MAX),
             role,
             unused: node.attrs.unused,
             predicate: node.predicate,
@@ -1124,7 +1158,7 @@ fn stage_bit(stage: &Stage) -> u8 {
 /// grid builtins as kernels do, except the dispatch and stage-in ones, and a mesh function its
 /// vertex amplification's id and count (the VFX framework's particle meshes take
 /// `[[amplification_id]]` under a function constant).
-fn input_in_stage(role: &ParamRole, stage: &Stage) -> bool {
+pub(crate) fn input_in_stage(role: &ParamRole, stage: &Stage) -> bool {
     let stages = match role {
         ParamRole::Buffer(_)
         | ParamRole::ArgumentBuffer(_)

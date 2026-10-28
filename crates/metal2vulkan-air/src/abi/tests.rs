@@ -268,22 +268,31 @@ fn unknown_key_is_refused() {
     expect_abi(k.decode(), AbiError::UnknownKey);
 }
 
-/// MSL 3.2's program-scope buffer bindings (`!air.global_bindings`) are valid AIR this version
-/// does not implement: refused as unsupported, not as malformed input.
+/// MSL 3.2's program-scope bindings (`!air.global_bindings`) decode to their global and the
+/// binding of their argument node, a parameter node of index -1; a malformed entry is refused.
 #[test]
-fn program_scope_bindings_are_unsupported_not_malformed() {
+fn program_scope_bindings_decode_to_their_global_and_argument() {
     let mut k = Kernel::standard();
-    let binding = node(&mut k.b, &[S("air.global_binding")]);
+    let ty = k.b.ptr(AddrSpace::Device);
+    let g = k.b.simple_global("tex", ty, AddrSpace::Constant, None);
+    let arg = node(&mut k.b, &texture_arg(u64::from(u32::MAX)));
+    let binding = node(&mut k.b, &[S("air.global_binding"), G(g), N(arg)]);
     k.b.named_md("air.global_bindings", &[binding]);
-    let err = k.decode().unwrap_err();
-    let Error::Unsupported(u) = err else {
-        panic!("not unsupported: {err:?}")
+    let abi = k.decode().expect("decodes");
+    let [b] = &abi.global_bindings[..] else {
+        panic!("{:?}", abi.global_bindings)
     };
-    assert_eq!(u.feature, Feature::ProgramScopeBinding);
-    // Any other named list outside the closed set is still a key outside the contract.
+    assert_eq!(b.global, g);
+    assert_eq!(b.binding.param, u32::MAX);
+    assert!(
+        matches!(b.binding.role, ParamRole::Texture(_)),
+        "{:?}",
+        b.binding.role
+    );
+    // An entry that is not an `air.global_binding` is a key outside the contract.
     let mut k = Kernel::standard();
     let other = node(&mut k.b, &[S("air.no_such_entry")]);
-    k.b.named_md("air.no_such_list", &[other]);
+    k.b.named_md("air.global_bindings", &[other]);
     expect_abi(k.decode(), AbiError::UnknownKey);
 }
 
@@ -2238,6 +2247,7 @@ fn pointee_size_and_layout_checks() {
         entries: vec![],
         function_constants: vec![],
         static_samplers: vec![],
+        global_bindings: Vec::new(),
         visible_function_refs: vec![],
         visible_functions: vec![],
         core_image_kernels: vec![],

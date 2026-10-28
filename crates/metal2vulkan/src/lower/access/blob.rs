@@ -57,11 +57,11 @@ pub enum BlobStrategy {
     Copy {
         of: LocalPtr,
     },
-    /// `select c, t, f` of two blob pointers.
+    /// `select c, t, f` of two blob pointers; either may be a blob global's address itself.
     Select {
         c: ValueId,
-        t: ValueId,
-        f: ValueId,
+        t: LocalPtr,
+        f: LocalPtr,
     },
     Load(BlobLoad),
 }
@@ -250,8 +250,8 @@ pub fn select(
             use_blob(cx)?;
             BlobStrategy::Select {
                 c: operand(cx, *c)?,
-                t: operand(cx, *t)?,
-                f: operand(cx, *f)?,
+                t: blob_ptr(cx, *t)?,
+                f: blob_ptr(cx, *f)?,
             }
         }
         InstKind::Load {
@@ -357,8 +357,8 @@ pub fn emit(
         BlobStrategy::Copy { of } => ptr_value(cx, fb, *of)?,
         BlobStrategy::Select { c, t, f } => {
             let c = cx.operand(fb, *c)?;
-            let t = cx.operand(fb, *t)?;
-            let f = cx.operand(fb, *f)?;
+            let t = ptr_value(cx, fb, *t)?;
+            let f = ptr_value(cx, fb, *f)?;
             fb.select(c, t, f)?
         }
         BlobStrategy::Load(l) => {

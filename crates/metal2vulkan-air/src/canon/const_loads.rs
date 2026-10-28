@@ -122,7 +122,11 @@ fn find(
 /// global (empty for the global itself): `@g`, a `getelementptr` over `@g`'s value type at
 /// constant indices whose first is 0 (an instruction of `body` or a constant expression), through
 /// no-op pointer casts. `None` for any other address.
-fn field_address(body: &Body, parts: &ModuleParts, v: Value) -> Option<(GlobalId, Vec<u64>)> {
+pub(super) fn field_address(
+    body: &Body,
+    parts: &ModuleParts,
+    v: Value,
+) -> Option<(GlobalId, Vec<u64>)> {
     let consts = &parts.consts;
     let (src_ty, base, indices): (TypeId, Value, Vec<Value>) = match v {
         Value::Inst(i) => match &body.insts.get(i)?.kind {

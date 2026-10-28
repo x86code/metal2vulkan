@@ -1830,7 +1830,11 @@ fn input_builtin(
             )
         }
         Bi::FrontFacing if !vertex => {
-            if f.held != Held::Bool || f.lanes != 1 {
+            // x86Code: a specialized function can take `[[front_facing]]` as its in-memory
+            // `bool`, an `i8` (RenderBox's `path_interior_fragment` as MTLSimDriver sends it);
+            // `to_lowered` widens the builtin's `bool` to 1 or 0 for an integer form.
+            let int_bool = matches!(f.held, Held::Int { container: 32, .. });
+            if (f.held != Held::Bool && !int_bool) || f.lanes != 1 {
                 return Err(not_lowered());
             }
             (

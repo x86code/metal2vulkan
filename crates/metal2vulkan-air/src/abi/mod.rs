@@ -52,6 +52,7 @@ mod structs;
 mod tests;
 mod visible;
 
+pub(crate) use args::input_in_stage;
 pub use check::data_type_is;
 pub use sampler::Half;
 pub use sampler::{
@@ -110,6 +111,8 @@ pub struct AirAbi {
     pub function_constants: Vec<FunctionConstantDecl>,
     /// `!air.sampler_states`: constexpr samplers.
     pub static_samplers: Vec<StaticSampler>,
+    /// `!air.global_bindings`: MSL 3.2 program-scope bindings, in list order.
+    pub global_bindings: Vec<GlobalBinding>,
     /// `!air.visible_function_references`.
     pub visible_function_refs: Vec<VisibleFunctionRef>,
     /// `!air.visible`: the functions this module exports to the Metal linker, in list order.
@@ -1117,6 +1120,18 @@ pub struct FunctionConstantDecl {
     /// The constant's type as the metadata spells it: an MSL type name (`bool`, `uint`,
     /// `float4`), the one place AIR distinguishes a signed integer from an unsigned one.
     pub type_name: DiagName,
+}
+
+/// An MSL 3.2 program-scope binding (`constant T* constant p [[buffer(n)]];`, `texture2d<half>
+/// t [[texture(n)]];` at program scope): `!{!"air.global_binding", <global>, <node>}`. The
+/// global is an `externally_initialized` constant whose value Metal gives from the argument the
+/// node describes, a parameter node of index -1 read as an entry's parameter node would be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalBinding {
+    /// The program-scope global the argument's value is read through.
+    pub global: GlobalId,
+    /// The argument, as an entry parameter's binding; `param` is the node's index (`u32::MAX`).
+    pub binding: ParamBinding,
 }
 
 /// A constexpr sampler: its global and decoded state.
