@@ -16,6 +16,20 @@ pub struct EnvVar {
 /// Every `METAL2VULKAN_*` var, for `--help`. Order is stable so the help text is deterministic.
 pub const REGISTRY: &[EnvVar] = &[
     EnvVar {
+        name: "METAL2VULKAN_QUEUES",
+        default: "unset (up to 16)",
+        effect: "metal2vulkan-runtime: the most VkQueues a created device takes for its logical \
+                 queues' round robin (4 to 16); each costs host memory in the driver (about \
+                 2.3 MiB on NVIDIA's)",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_SYSTEM_BLOCK_MIB",
+        default: "unset (16)",
+        effect: "metal2vulkan-runtime's diagnostics: the MiB of a pooled block of system memory \
+                 (host-visible, outside every device-local heap), which a discrete GPU's driver \
+                 pins whole as it is allocated",
+    },
+    EnvVar {
         name: "METAL2VULKAN_REPRO_DIR",
         default: "$TMPDIR/metal2vulkan-repros",
         effect: "base directory for FALLBACK repro bundles",
@@ -84,6 +98,27 @@ pub fn repro_dir() -> Option<OsString> {
 /// is not Unicode). A default-off diagnostic of the lane's test devices; no product path reads it.
 pub fn lane_validation() -> Option<OsString> {
     std::env::var_os("METAL2VULKAN_LANE_VALIDATION")
+}
+
+/// `METAL2VULKAN_QUEUES` (`REGISTRY`): the most `VkQueue`s a created device's round robin takes, where
+/// set to a number.
+pub fn queues() -> Option<u32> {
+    std::env::var("METAL2VULKAN_QUEUES")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `METAL2VULKAN_SYSTEM_BLOCK_MIB` (`REGISTRY`): the MiB of a pooled block of system memory, where
+/// set to a number above 0.
+pub fn system_block_mib() -> Option<u64> {
+    std::env::var("METAL2VULKAN_SYSTEM_BLOCK_MIB")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&v: &u64| v > 0)
 }
 
 /// Whether metal2vulkan-runtime logs each render `VkPipeline` it makes (`REGISTRY`): set, and

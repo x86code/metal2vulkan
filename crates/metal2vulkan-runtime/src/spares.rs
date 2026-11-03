@@ -116,6 +116,13 @@ pub(super) const DESCRIPTOR_POOLS: usize = 256;
 /// The most descriptors the spare descriptor pools hold together.
 pub(super) const DESCRIPTORS: u64 = 1 << 18;
 
+/// The newest spare command pools of each queue family a trim leaves as they are
+/// ([`Spares::trim`]): a quiet compositor's frame takes a few.
+pub(super) const TRIM_KEEP: usize = 4;
+
+/// The spare descriptor pools of each list a trim of a quiet device keeps ([`Spares::trim`]).
+pub(super) const TRIM_KEEP_DESCRIPTOR_POOLS: usize = 16;
+
 /// The index of `level`'s list in a [`CommandPool`]: primary 0, secondary 1.
 fn level_index(level: vk::CommandBufferLevel) -> usize {
     usize::from(level == vk::CommandBufferLevel::SECONDARY)
@@ -136,6 +143,9 @@ pub(super) struct CommandPool {
     /// did not complete, or left one it was handed unended (the module docs), so its taker
     /// resets it.
     pub(super) recording: bool,
+    /// When it was last given back (x86Code RAM 2, [`Spares::trim`]): `None` while a command
+    /// buffer holds it, and once a trim released its memory, until a command buffer takes it.
+    given: Option<std::time::Instant>,
 }
 
 impl CommandPool {
@@ -148,6 +158,7 @@ impl CommandPool {
             handed: [0, 0],
             begun: None,
             recording: false,
+            given: None,
         }
     }
 
@@ -195,6 +206,7 @@ impl CommandPool {
         }
         self.handed = [0, 0];
         self.recording = false;
+        self.given = None;
     }
 
     /// Whether the pool made no secondary command buffer (the module docs).
@@ -295,6 +307,8 @@ pub(super) struct Spares {
     descriptor_pools: Mutex<VecDeque<DescriptorPool>>,
     /// The fitted arenas' (the module docs), oldest first.
     fitted_pools: Mutex<VecDeque<DescriptorPool>>,
+    /// When a command buffer last gave back a command pool ([`Spares::trim`]).
+    last_given: Mutex<Option<std::time::Instant>>,
 }
 
 impl Spares {
@@ -344,8 +358,99 @@ impl Spares {
         settled: bool,
     ) {
         pool.recording = !settled;
+        pool.given = Some(std::time::Instant::now());
         pool.stock(device);
         keep_command_pool(&mut lock(&self.command_pools), pool);
+        *lock(&self.last_given) = Some(std::time::Instant::now());
+    }
+
+    /// x86Code RAM 2: give back the driver memory of the spare command pools no command buffer
+    /// took for `idle` (`vkResetCommandPool` with `RELEASE_RESOURCES`: the pool and its command
+    /// buffers stay, their recorded memory goes), keeping the newest [`TRIM_KEEP`] spares of each
+    /// family as they are; and, where no command buffer gave back anything for `idle`, release
+    /// the spare descriptor pools past [`TRIM_KEEP_DESCRIPTOR_POOLS`] of each list, oldest first.
+    /// The spares hold what their largest command buffer recorded, for good: on NVIDIA's
+    /// 615.78.08 its 2 MiB chunks of pinned system memory (a phone's compositor, after a few apps:
+    /// 24 chunks, 48 MiB, never given back). A trimmed pool goes to the oldest end, so takers take
+    /// the untrimmed first. Outside sections alone, as a taker's reset. Returns the command pools
+    /// trimmed and the descriptor pools released.
+    pub(super) fn trim(&self, device: &DeviceShared, idle: std::time::Duration) -> (usize, usize) {
+        if exit_guard::in_section() {
+            return (0, 0);
+        }
+        let now = std::time::Instant::now();
+        let stale =
+            |pool: &CommandPool| pool.given.is_some_and(|at| now.duration_since(at) >= idle);
+        let mut taken = Vec::new();
+        {
+            let mut pools = lock(&self.command_pools);
+            let mut newest: Vec<(u32, usize)> = Vec::new();
+            let mut at = pools.len();
+            while at > 0 {
+                at -= 1;
+                let family = pools[at].family;
+                let seen = match newest.iter_mut().find(|(f, _)| *f == family) {
+                    Some((_, n)) => {
+                        *n += 1;
+                        *n
+                    }
+                    None => {
+                        newest.push((family, 1));
+                        1
+                    }
+                };
+                if seen > TRIM_KEEP && stale(&pools[at]) {
+                    taken.push(pools.remove(at));
+                }
+            }
+        }
+        let mut trimmed = 0;
+        let mut kept = Vec::with_capacity(taken.len());
+        for mut pool in taken {
+            // SAFETY: the pool is out of the spares, this thread's alone, and nothing of it is
+            // pending: a command buffer gave it back once its work ended.
+            let reset = unsafe {
+                device
+                    .vk()
+                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
+            };
+            if reset.is_err() {
+                // SAFETY: as above.
+                unsafe { release_in_section(device, pool.raw) };
+                continue;
+            }
+            // The reset left every command buffer of it, the primary begun ahead too, initial.
+            if let Some(buffer) = pool.begun.take() {
+                pool.made[level_index(vk::CommandBufferLevel::PRIMARY)].push(buffer);
+            }
+            pool.recording = false;
+            pool.given = None;
+            trimmed += 1;
+            kept.push(pool);
+        }
+        if !kept.is_empty() {
+            let mut pools = lock(&self.command_pools);
+            for pool in kept {
+                pools.insert(0, pool);
+            }
+        }
+        let quiet = lock(&self.last_given).is_none_or(|at| now.duration_since(at) >= idle);
+        let mut released = 0;
+        if quiet {
+            for pools in [&self.descriptor_pools, &self.fitted_pools] {
+                let past: Vec<vk::DescriptorPool> = {
+                    let mut pools = lock(pools);
+                    let n = pools.len().saturating_sub(TRIM_KEEP_DESCRIPTOR_POOLS);
+                    pools.drain(..n).map(|pool| pool.raw).collect()
+                };
+                released += past.len();
+                for raw in past {
+                    // SAFETY: a spare: nothing uses its sets, and nothing else holds it.
+                    unsafe { release_in_section(device, raw) };
+                }
+            }
+        }
+        (trimmed, released)
     }
 
     /// Begin a primary ahead in the spare command pool `raw` of `device`, where it is still a

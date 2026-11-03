@@ -66,6 +66,21 @@ use std::time::{Duration, Instant};
 /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
 pub(super) const BLOCK_BYTES: u64 = 64 << 20;
 
+/// The size of a pooled block of system memory: a host-visible memory type outside every
+/// device-local heap (x86Code RAM 2). A discrete GPU's driver pins such a block whole in the
+/// host's RAM as it is allocated (NVIDIA 615.78.08: a 64 MiB block of the runtime's `Shared` pool,
+/// made by [`keep_room`] at the first command queue for the upload arena's 64 KiB chunks, was 64 MiB
+/// of the process's resident memory, mostly unused). Device-local blocks stay [`BLOCK_BYTES`]:
+/// their bytes are the GPU's. `METAL2VULKAN_SYSTEM_BLOCK_MIB` overrides it (diagnostics).
+pub(super) const SYSTEM_BLOCK_BYTES: u64 = 16 << 20;
+
+fn system_block_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        metal2vulkan::env_vars::system_block_mib().map_or(SYSTEM_BLOCK_BYTES, |v| v << 20)
+    })
+}
+
 /// The most empty pooled blocks a pool keeps for its next placements ([`Pool::release`]), at
 /// most 128 MiB of empty memory a pool. In a pool the encodings place in, one of them is mostly
 /// the block [`keep_room`] made for room: with one kept, every other block that emptied was freed,
@@ -82,6 +97,20 @@ pub(super) const KEPT_EMPTY_FOR: Duration = Duration::from_secs(1);
 /// (`memory_log.rs`): a few such placements fill a block, so their comings and goings are what
 /// makes and frees blocks.
 const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
+
+/// The memory types of system memory among `properties`': host-visible, in a heap that is not
+/// device-local (x86Code RAM 2, [`SYSTEM_BLOCK_BYTES`]), as bits.
+fn system_types(properties: &vk::PhysicalDeviceMemoryProperties) -> u32 {
+    let count = (properties.memory_type_count as usize).min(vk::MAX_MEMORY_TYPES);
+    (properties.memory_types[..count].iter().enumerate())
+        .filter(|(_, ty)| {
+            let heap = properties.memory_heaps.get(ty.heap_index as usize);
+            ty.property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                && !heap.is_some_and(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        })
+        .fold(0, |bits, (index, _)| bits | 1 << index)
+}
 
 /// What memory a resource needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -987,6 +1016,9 @@ pub(super) struct Memory {
     /// The buffers' pools by memory type, then the images' ([`Memory::pool`]).
     pools: Vec<Pool<Block>>,
     block_bytes: u64,
+    /// The memory types of system memory (host-visible, in no device-local heap), as bits: their
+    /// pooled blocks are [`system_block_bytes`].
+    system_types: u32,
     /// Blocks are allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`: the device enabled
     /// `bufferDeviceAddress`, so buffers carry device addresses.
     device_address: bool,
@@ -1042,6 +1074,7 @@ impl Memory {
                 .collect(),
             types,
             block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
+            system_types: system_types(properties),
             device_address,
             address_types: None,
             kept: None,
@@ -1252,6 +1285,7 @@ impl Memory {
             .fold(0, |bits, (index, _)| bits | 1 << index);
         BlockMaker {
             block_bytes: self.block_bytes,
+            system_types: self.system_types,
             host_visible,
             device_address: self.device_address,
             families: self.families.clone(),
@@ -1720,6 +1754,8 @@ impl Memory {
 struct BlockMaker {
     /// A pooled block's size ([`BLOCK_BYTES`], or the device's largest allocation).
     block_bytes: u64,
+    /// As [`Memory`]'s.
+    system_types: u32,
     /// The host-visible memory types, as bits: a block of one is mapped whole.
     host_visible: u32,
     /// As [`Memory`]'s.
@@ -1729,6 +1765,15 @@ struct BlockMaker {
 }
 
 impl BlockMaker {
+    /// A pooled block's size in memory type `type_index`.
+    fn block_bytes_of(&self, type_index: u32) -> u64 {
+        if self.system_types & (1 << type_index) != 0 {
+            system_block_bytes().min(self.block_bytes)
+        } else {
+            self.block_bytes
+        }
+    }
+
     /// A new block of `size` bytes of memory type `type_index`, with a buffer of addresses where
     /// `addressed` gives the counts of such buffers made (its memory then as long as that buffer
     /// requires, if longer).
@@ -2064,10 +2109,14 @@ fn place(
     if candidates.is_empty() {
         return Err(Error::OutOfMemory(MemoryKind::Device));
     }
-    let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
-    let block_size = if dedicated { size } else { maker.block_bytes };
     let mut failure = Error::OutOfMemory(MemoryKind::Device);
     for type_index in candidates {
+        let dedicated = fit == Fit::Apart || size > maker.block_bytes_of(type_index) / 2;
+        let block_size = if dedicated {
+            size
+        } else {
+            maker.block_bytes_of(type_index)
+        };
         let pool = (holds, type_index);
         if fit == Fit::Pooled {
             if let Some(placement) =
@@ -2111,19 +2160,24 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
         let Ok(kept) = memory.kept(device) else {
             return;
         };
-        let room = memory.block_bytes / 2;
+        let maker = memory.maker();
         let lacking: Vec<(Holds, u32)> = (kept.into_iter())
-            .filter(|&(holds, type_index)| !memory.pool(holds, type_index).has_room(room))
+            .filter(|&(holds, type_index)| {
+                !memory
+                    .pool(holds, type_index)
+                    .has_room(maker.block_bytes_of(type_index) / 2)
+            })
             .collect();
-        (lacking, memory.maker())
+        (lacking, maker)
     };
     for pool in lacking {
         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
-        let Ok(block) = maker.make(device, pool.1, maker.block_bytes, addressed) else {
+        let bytes = maker.block_bytes_of(pool.1);
+        let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
             continue;
         };
         let mut memory = lock(memory);
-        if memory.pool(pool.0, pool.1).has_room(maker.block_bytes / 2) {
+        if memory.pool(pool.0, pool.1).has_room(bytes / 2) {
             let what = "made a pooled block and freed it at once, its pool having room";
             memory.say_block(what, &block);
             drop(memory);
@@ -2131,6 +2185,6 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
             unsafe { block.release(device) };
             continue;
         }
-        memory.add_block(pool, block, maker.block_bytes, false, 0);
+        memory.add_block(pool, block, bytes, false, 0);
     }
 }

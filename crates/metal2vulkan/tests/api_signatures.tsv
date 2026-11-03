@@ -7791,6 +7791,7 @@ method	metal2vulkan-runtime::Device::system_default	pub fn system_default() -> R
 method	metal2vulkan-runtime::Device::system_default_identity_with	pub fn system_default_identity_with(options: &DeviceOptions) -> Result<PhysicalDeviceIdentity, Error>
 method	metal2vulkan-runtime::Device::system_default_with	pub fn system_default_with(options: &DeviceOptions) -> Result<Device, Error>
 method	metal2vulkan-runtime::Device::texture_level_info	pub fn texture_level_info(&self, query: &TextureLevelQuery) -> TextureLevelInfo
+method	metal2vulkan-runtime::Device::trim_idle	pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize)
 method	metal2vulkan-runtime::Device::vk_buffer_usage	pub fn vk_buffer_usage(&self) -> BufferUsageFlags
 method	metal2vulkan-runtime::Device::with_loader_word	pub fn with_loader_word<R>(&self, call: impl FnOnce() -> R) -> R
 method	metal2vulkan-runtime::Device::with_registry_id	pub fn with_registry_id(registry_id: u64, options: &DeviceOptions) -> Result<Device, Error>

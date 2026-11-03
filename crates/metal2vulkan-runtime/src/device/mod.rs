@@ -922,6 +922,17 @@ impl Device {
         &self.0
     }
 
+    /// x86Code RAM 2: give back what the device's spares hold past their use, for a long-lived
+    /// consumer whose work comes in bursts (a phone's compositor): the driver memory of spare
+    /// command pools no command buffer took for `idle`, and, where nothing was given back for
+    /// `idle`, the spare descriptor pools past a few (`spares.rs`, `Spares::trim`). Costs the next
+    /// burst the re-growth of what it needs (a pool's chunks, a descriptor pool's making). Returns
+    /// the command pools trimmed and the descriptor pools released. No Metal counterpart.
+    #[doc(hidden)]
+    pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize) {
+        self.0.spares.trim(&self.0, idle)
+    }
+
     /// Keep room in the memory pools the runtime's encodings and commits place their own
     /// resources in (`memory::keep_room`): called by the creation calls that may wait (a queue's,
     /// a pipeline state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes

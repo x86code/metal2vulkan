@@ -811,6 +811,16 @@ const LEAST_QUEUES: u32 = 4;
 /// with the queues.
 const ROUND_ROBIN_CEILING: u32 = 16;
 
+/// [`ROUND_ROBIN_CEILING`], or `METAL2VULKAN_QUEUES` where set (x86Code RAM 2): each `VkQueue`
+/// NVIDIA's driver makes costs the process about 2.8 MiB of host memory (615.78.08: one queue 36
+/// MiB of PSS for a bare device, sixteen 80 MiB), so a consumer that runs few logical queues at once
+/// may take fewer. At least [`LEAST_QUEUES`].
+fn round_robin_ceiling() -> u32 {
+    metal2vulkan::env_vars::queues().map_or(ROUND_ROBIN_CEILING, |v| {
+        v.clamp(LEAST_QUEUES, ROUND_ROBIN_CEILING)
+    })
+}
+
 /// The most `VkQueue`s a created device reserves for presenting queues
 /// (`Device::new_command_queue_for_presenting`), outside the round robin: the taken families'
 /// queues past the round robin's, where they have them.
@@ -871,7 +881,7 @@ pub(crate) fn queue_plan(families: &[vk::QueueFamilyProperties]) -> Option<Queue
         .flat_map(|index| taken.iter().map(move |&family| (family, index)))
         .collect::<Vec<_>>();
     let round_robin = (order.len().saturating_sub(PRESENT_QUEUES as usize))
-        .clamp(LEAST_QUEUES as usize, ROUND_ROBIN_CEILING as usize)
+        .clamp(LEAST_QUEUES as usize, round_robin_ceiling() as usize)
         .min(order.len());
     let present = order.split_off(round_robin);
     // Transfers alone (sparse binding and protected memory aside: no graphics, compute, video or
