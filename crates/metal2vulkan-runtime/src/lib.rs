@@ -48,6 +48,7 @@ mod buffer_descriptor;
 mod buffer_texture;
 mod capabilities;
 mod chroma_pairs;
+mod census;
 mod churn_counts;
 mod clear_reach;
 mod clear_value;

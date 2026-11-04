@@ -193,6 +193,20 @@ impl<K: Clone + Eq + Hash, V> Making<K, V> {
         }
     }
 
+    /// x86Code RAM 8: the objects made that nothing but the memo holds, taken out (a long-lived
+    /// consumer's idle trim, `RenderVariant::trim_idle`). A making in flight stays, as does an
+    /// object a command buffer or a caller holds.
+    pub(crate) fn take_unheld(&self) -> Vec<Arc<V>> {
+        lock(&self.memo)
+            .take_where(|entry| matches!(entry, Entry::Made(made) if Arc::strong_count(made) == 1))
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Made(made) => Some(made),
+                Entry::Making(_) => None,
+            })
+            .collect()
+    }
+
     /// Keep `made` under `key`, made before: a released variant's `VkPipeline` taken back
     /// (`kept.rs`).
     pub(crate) fn seed(&self, key: K, made: V) {

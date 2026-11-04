@@ -93,6 +93,9 @@ impl Part {
 /// needs it ([`Library::made`]).
 pub(crate) struct Library {
     state: Mutex<Slot>,
+    /// x86Code RAM 8: when a caller last claimed it (`census::now_secs`), which the idle trim
+    /// reads (`Libraries::trim_idle`).
+    claimed: std::sync::atomic::AtomicU64,
     /// Signalled as a making ends.
     ended: Condvar,
 }
@@ -125,6 +128,7 @@ impl Library {
     fn new() -> Library {
         Library {
             state: Mutex::new(Slot::Waiting),
+            claimed: std::sync::atomic::AtomicU64::new(crate::census::now_secs()),
             ended: Condvar::new(),
         }
     }
@@ -170,6 +174,7 @@ impl Library {
         drop(state);
         let claim = Claim(self);
         let raw = make()?;
+        crate::census::add(&crate::census::LIBRARIES, 1);
         *lock(&self.state) = Slot::Made(raw);
         drop(claim);
         Ok(raw)
@@ -179,6 +184,7 @@ impl Library {
 impl Owned<DeviceShared> for Library {
     fn destroy(&self, shared: &DeviceShared) {
         if let Slot::Made(raw) = *lock(&self.state) {
+            crate::census::add(&crate::census::LIBRARIES, -1);
             // SAFETY: the map lets a library go only when nothing else holds it, so no pipeline
             // it linked is left (each holds it, and a command buffer holds the pipelines its
             // commands use until it completes) and none is being linked; or at the device's
@@ -217,6 +223,9 @@ impl Libraries {
             // Destroyed here, the map's lock released.
             gone.destroy(shared);
             library
+                .claimed
+                .store(crate::census::now_secs(), std::sync::atomic::Ordering::Relaxed);
+            library
         });
         Linked(claimed)
     }
@@ -228,6 +237,27 @@ impl Libraries {
             let gone = lock(part).settle();
             gone.destroy(shared);
         }
+    }
+
+    /// x86Code RAM 8: destroy the libraries nothing but the map holds that no caller claimed for
+    /// `idle` (a long-lived consumer's trim thread): those whose linked pipelines are all gone
+    /// (released states, kept pipelines trimmed). The map otherwise lets them go only at a
+    /// program's settle, which an idle program never reaches. A linked pipeline must keep its
+    /// libraries: NVIDIA 615's fast-linked pipeline reads them as it is bound (a segfault in
+    /// vkCmdBindPipeline's recording when they went at its creation). Returns how many were
+    /// destroyed.
+    pub(crate) fn trim_idle(&self, shared: &DeviceShared, idle: std::time::Duration) -> usize {
+        let now = crate::census::now_secs();
+        let mut destroyed = 0;
+        for part in &self.parts {
+            let gone = lock(part).take_idle(|library| {
+                let claimed = library.claimed.load(std::sync::atomic::Ordering::Relaxed);
+                now.saturating_sub(claimed) >= idle.as_secs() && !matches!(*lock(&library.state), Slot::Making)
+            });
+            destroyed += gone.len();
+            gone.destroy(shared);
+        }
+        destroyed
     }
 
     /// Every library, at the device's teardown, after the kept pipelines it linked.

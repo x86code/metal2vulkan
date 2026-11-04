@@ -338,13 +338,26 @@ impl Spares {
             return Ok(None);
         };
         if pool.recording {
+            // x86Code RAM 8: reset with RELEASE_RESOURCES. NVIDIA's pool otherwise keeps every
+            // chunk of command memory its largest command buffer grew to (2 MB chunks), so each
+            // spare in flight held its busiest use's memory, and the driver maps new chunks for
+            // the next burst: the device's command memory grew to the sum of the pools' high
+            // waters (31 -> 142 MB after a gate run). Released, the chunks go back to the
+            // device's own cache, which the next begin takes from (devprobe cbgrow: 40 pools
+            // that each once recorded 20000 commands, then 40 small command buffers in flight:
+            // 46 MB without, 16 MB with). METAL2VULKAN_POOL_RESET_KEEP=1 resets without.
+            static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let keep = *KEEP.get_or_init(|| {
+                std::env::var("METAL2VULKAN_POOL_RESET_KEEP").as_deref() == Ok("1")
+            });
+            let flags = if keep {
+                vk::CommandPoolResetFlags::empty()
+            } else {
+                vk::CommandPoolResetFlags::RELEASE_RESOURCES
+            };
             // SAFETY: the pool is the caller's alone now, and nothing of it is pending: the
             // command buffer that gave it back ended its work or was never submitted.
-            let reset = unsafe {
-                device
-                    .vk()
-                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::empty())
-            };
+            let reset = unsafe { device.vk().reset_command_pool(pool.raw, flags) };
             if let Err(error) = reset {
                 // SAFETY: as above.
                 unsafe { release_in_section(device, pool.raw) };

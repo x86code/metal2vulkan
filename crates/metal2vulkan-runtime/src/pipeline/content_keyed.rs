@@ -88,6 +88,13 @@ impl<K, T> Default for ContentKeyed<K, T> {
 pub(crate) struct Gone<T>(Vec<Arc<T>>);
 
 impl<T> Gone<T> {
+    /// How many objects it holds.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T> Gone<T> {
     /// Destroy each, in order, through `owner`.
     pub(crate) fn destroy<C: ?Sized>(self, owner: &C)
     where
@@ -179,6 +186,24 @@ impl<K: Hash + Eq, T> ContentKeyed<K, T> {
             false
         });
         gone
+    }
+
+    /// x86Code RAM 8: let go of the objects the map alone holds that `idle` picks, in the order
+    /// they were inserted: a long-lived consumer's trim (`Libraries::trim_idle`), on its own
+    /// thread. Unique with an Acquire, as in `settle`, so no holder uses one.
+    pub(crate) fn take_idle(&mut self, idle: impl Fn(&T) -> bool) -> Gone<T> {
+        let mut gone: Vec<(u64, Arc<T>)> = Vec::new();
+        self.entries.retain(|_, (at, object)| {
+            if Arc::get_mut(object).is_none() || !idle(object) {
+                return true;
+            }
+            gone.push((*at, Arc::clone(object)));
+            false
+        });
+        gone.sort_by_key(|(at, _)| *at);
+        let mut gone: Vec<Arc<T>> = gone.into_iter().map(|(_, object)| object).collect();
+        gone.extend(self.unheld_own());
+        Gone(gone)
     }
 
     /// Every object, those found by lookups in the order they were inserted, then the own ones:

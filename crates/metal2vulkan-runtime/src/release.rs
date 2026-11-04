@@ -51,6 +51,9 @@ pub(crate) unsafe fn object<T: Released>(device: &ash::Device, object: T) -> boo
     // SAFETY: the caller's.
     unsafe { object.destroy(device, Door(())) };
     exit_guard::called(T::CALL);
+    if matches!(T::CALL, Call::DestroyPipeline) {
+        crate::census::add(&crate::census::PIPELINES, -1);
+    }
     let counted = match T::CALL {
         Call::DestroyImage => Some(VkRelease::Image),
         Call::DestroyBuffer => Some(VkRelease::Buffer),

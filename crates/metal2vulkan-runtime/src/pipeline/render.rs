@@ -534,6 +534,56 @@ pub(crate) struct RenderVariant {
     /// where the log is on: worked out beside its objects as it is made
     /// ([`RenderVariant::logged_spirv`]).
     logged_spirv: OnceLock<Box<[u64]>>,
+    /// x86Code RAM 8: its share of the census (`census.rs`).
+    _census: crate::census::CountedVariant,
+    /// x86Code RAM 8: when a draw last looked its `VkPipeline`s up (`census::now_secs`), which
+    /// the idle trim reads ([`RenderVariant::trim_idle`]).
+    drawn: std::sync::atomic::AtomicU64,
+}
+
+/// x86Code RAM 8: the render variants made, held weakly, for the idle trim
+/// ([`RenderVariant::trim_idle`]); the dead ones go at each trim.
+static LIVE_VARIANTS: Mutex<Vec<Weak<RenderVariant>>> = Mutex::new(Vec::new());
+
+impl RenderVariant {
+    /// x86Code RAM 8: destroy the `VkPipeline`s of `device`'s render variants no draw looked up for
+    /// `idle`, but those a command buffer or a caller still holds: a long-lived consumer's trim
+    /// thread (mtlvk's), for a window server's states that stay made long after their app went
+    /// (CoreAnimation keeps them). Each is destroyed at once rather than kept for its variant
+    /// (`kept.rs`), and lets go of its graphics pipeline libraries, which the libraries' trim
+    /// then destroys. A later draw makes the pipeline again, from the device's shader cache and
+    /// the driver's (fast-linked where the device links: the libraries made again). Returns how
+    /// many were destroyed.
+    pub(crate) fn trim_idle(device: &Device, idle: std::time::Duration) -> usize {
+        let now = crate::census::now_secs();
+        let variants: Vec<Arc<RenderVariant>> = {
+            let mut live = lock(&LIVE_VARIANTS);
+            live.retain(|v| v.strong_count() > 0);
+            live.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut destroyed = 0;
+        for variant in variants {
+            if !variant.objects.device.same(device)
+                || now.saturating_sub(variant.drawn.load(std::sync::atomic::Ordering::Relaxed))
+                    < idle.as_secs()
+            {
+                continue;
+            }
+            for made in variant.pipelines.take_unheld() {
+                if let Ok(mut raw) = Arc::try_unwrap(made) {
+                    raw.keep = None;
+                    destroyed += 1;
+                }
+            }
+        }
+        destroyed
+    }
+
+    /// x86Code RAM 8: a draw looks its `VkPipeline`s up now.
+    fn note_drawn(&self) {
+        self.drawn
+            .store(crate::census::now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A render creation's reflection, worked out beside it ([`GraphicsState::create_reflecting`]).
@@ -2717,6 +2767,7 @@ impl RenderVariant {
             )
         })?;
         let stages = handle_stages(&pipeline.layout, every_render_stage());
+        let census = crate::census::CountedVariant::new(pipeline.footprint());
         let variant = Arc::new(RenderVariant {
             key,
             pipeline,
@@ -2727,7 +2778,10 @@ impl RenderVariant {
             handle_stages: stages,
             draw_dynamic: OnceLock::new(),
             logged_spirv,
+            _census: census,
+            drawn: std::sync::atomic::AtomicU64::new(crate::census::now_secs()),
         });
+        lock(&LIVE_VARIANTS).push(Arc::downgrade(&variant));
         for (place, made) in kept {
             if let Place::Graphics(graphics) = place {
                 variant.pipelines.seed(*graphics, made);
@@ -3005,6 +3059,7 @@ impl RenderVariant {
         compatible: &Arc<RenderPassObject>,
         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
     ) -> (DrawPipeline, bool) {
+        self.note_drawn();
         if let Some(made) = self.last_made(state, key) {
             return (DrawPipeline::Made(made), true);
         }
@@ -3056,6 +3111,7 @@ impl RenderVariant {
         render_pass: &Arc<RenderPassObject>,
         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
     ) -> Result<Arc<RawPipeline>, Error> {
+        self.note_drawn();
         if let Some(made) = self.last_made(state, key) {
             return Ok(made);
         }

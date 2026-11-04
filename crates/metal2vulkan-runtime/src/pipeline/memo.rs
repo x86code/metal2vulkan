@@ -164,6 +164,26 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
         }
     }
 
+    /// x86Code RAM 8: remove the entries `take` picks, and give their values.
+    pub(crate) fn take_where(&mut self, take: impl Fn(&V) -> bool) -> Vec<V> {
+        let picked: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, slot)| take(&slot.value))
+            .map(|(number, _)| *number)
+            .collect();
+        let mut taken = Vec::with_capacity(picked.len());
+        for number in picked {
+            if let Some(slot) = self.entries.remove(&number) {
+                self.numbers.remove(&slot.key);
+                self.order.remove(&slot.used);
+                self.weight -= slot.weight;
+                taken.push(slot.value);
+            }
+        }
+        taken
+    }
+
     /// Remove `key`'s entry, if any.
     pub(crate) fn remove(&mut self, key: &K) {
         let Some(number) = self.numbers.remove(key) else {

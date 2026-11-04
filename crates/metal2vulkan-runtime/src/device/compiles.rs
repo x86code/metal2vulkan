@@ -355,6 +355,10 @@ unsafe extern "system" fn create_graphics_pipelines(
             driver(device, cache, count, infos, allocator, pipelines)
         });
         exit_guard::called(Call::CreateGraphicsPipelines);
+        // SAFETY: the caller's output array of `count` handles, written by the driver.
+        let out = unsafe { std::slice::from_raw_parts(pipelines, count as usize) };
+        let live = out.iter().filter(|p| **p != vk::Pipeline::null()).count();
+        crate::census::add(&crate::census::PIPELINES, live as i64);
         made
     })
 }
@@ -385,6 +389,10 @@ unsafe extern "system" fn create_compute_pipelines(
             driver(device, cache, count, infos, allocator, pipelines)
         });
         exit_guard::called(Call::CreateComputePipelines);
+        // SAFETY: the caller's output array of `count` handles, written by the driver.
+        let out = unsafe { std::slice::from_raw_parts(pipelines, count as usize) };
+        let live = out.iter().filter(|p| **p != vk::Pipeline::null()).count();
+        crate::census::add(&crate::census::PIPELINES, live as i64);
         made
     })
 }

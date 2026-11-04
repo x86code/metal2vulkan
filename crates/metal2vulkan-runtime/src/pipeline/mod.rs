@@ -1788,3 +1788,8 @@ fn compile_error(device: &Device, error: metal2vulkan::error::Error) -> Error {
         other => device_error(other),
     }
 }
+
+/// x86Code RAM 8: the render variants' idle `VkPipeline`s destroyed (`RenderVariant::trim_idle`).
+pub(crate) fn trim_idle_render(device: &crate::Device, idle: std::time::Duration) -> usize {
+    render::RenderVariant::trim_idle(device, idle)
+}

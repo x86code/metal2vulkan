@@ -929,6 +929,26 @@ impl Device {
         self.0.spares.counts()
     }
 
+    /// x86Code RAM 8: give back the pipelines idle for `idle`: the graphics pipeline libraries no
+    /// key claimed (`Libraries::trim_idle`) and the `VkPipeline`s of released variants kept
+    /// (`Kept::trim_idle`). Returns (libraries, kept pipelines) destroyed. No Metal counterpart.
+    #[doc(hidden)]
+    pub fn trim_idle_pipelines(&self, idle: std::time::Duration) -> (usize, usize) {
+        let shared = &*self.0;
+        let drawn = crate::pipeline::trim_idle_render(self, idle);
+        let kept = lock(&shared.kept).trim_idle(shared, idle) + drawn;
+        let libraries = shared.libraries.as_ref().map_or(0, |l| l.trim_idle(shared, idle));
+        (libraries, kept)
+    }
+
+    /// x86Code RAM 8: live `VkPipeline`s, graphics pipeline libraries and render variants
+    /// (`census.rs`), and the released variant instances the device keeps (`pipeline/kept.rs`).
+    #[doc(hidden)]
+    pub fn pipeline_census(&self) -> String {
+        let (instances, pipelines) = lock(&self.0.kept).counts();
+        format!("{} | kept {instances} instances ({pipelines} pipelines)", crate::census::summary())
+    }
+
     /// x86Code RAM 2: give back what the device's spares hold past their use, for a long-lived
     /// consumer whose work comes in bursts (a phone's compositor): the driver memory of spare
     /// command pools no command buffer took for `idle`, and, where nothing was given back for
@@ -957,7 +977,7 @@ impl Device {
     }
 
     /// Whether `other` is this device (the same handle, not merely the same physical device).
-    pub(super) fn same(&self, other: &Device) -> bool {
+    pub(crate) fn same(&self, other: &Device) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 

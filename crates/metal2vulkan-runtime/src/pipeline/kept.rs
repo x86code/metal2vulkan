@@ -195,6 +195,8 @@ struct Entry {
     instance: Instance,
     objects: Option<KeptObjects>,
     pipelines: Vec<KeptPipeline>,
+    /// x86Code RAM 8: when a release last came to it (`census::now_secs`).
+    released: u64,
 }
 
 impl Entry {
@@ -269,8 +271,11 @@ impl Entries {
                 instance,
                 objects: None,
                 pipelines: Vec::new(),
+                released: 0,
             },
         };
+        let mut entry = entry;
+        entry.released = crate::census::now_secs();
         while entries.len() >= KEPT {
             if let Some(oldest) = entries.pop_front() {
                 oldest.destroy(shared);
@@ -315,6 +320,42 @@ impl Kept {
     /// as [`objects_released`](Self::objects_released) says.
     pub(crate) fn pipeline_released(&mut self, instance: Instance, pipeline: KeptPipeline) {
         self.arrived.push(Arrival::Pipeline(instance, pipeline));
+    }
+
+    /// x86Code RAM 8: destroy the `VkPipeline`s of the instances no release came to for `idle`
+    /// (a long-lived consumer's trim thread): a state of theirs made again makes its pipelines
+    /// anew, from the caches, as one past [`KEPT`] does. The instances' objects stay. Returns how
+    /// many were destroyed.
+    pub(crate) fn trim_idle(&mut self, shared: &DeviceShared, idle: std::time::Duration) -> usize {
+        let now = crate::census::now_secs();
+        let mut destroyed = 0;
+        for entry in self.entries.0.iter_mut() {
+            if now.saturating_sub(entry.released) < idle.as_secs() || entry.pipelines.is_empty() {
+                continue;
+            }
+            entry.destroy(shared);
+            destroyed += entry.pipelines.len();
+            entry.pipelines.clear();
+        }
+        // The pipelines released since the last variant made, not yet applied: an idle program
+        // makes none, so they would wait for good.
+        self.arrived.retain(|arrival| match arrival {
+            Arrival::Pipeline(_, pipeline) => {
+                // SAFETY: released by its last holder, so no pending command uses it.
+                unsafe { release::object(shared.vk(), pipeline.raw) };
+                destroyed += 1;
+                false
+            }
+            Arrival::Objects(..) => true,
+        });
+        destroyed
+    }
+
+    /// x86Code RAM 8: the instances kept and their pipelines, the queued releases' included.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        let queued = self.arrived.iter().filter(|a| matches!(a, Arrival::Pipeline(..))).count();
+        let pipelines = self.entries.0.iter().map(|e| e.pipelines.len()).sum::<usize>();
+        (self.entries.0.len(), pipelines + queued)
     }
 
     /// Apply the queued releases, in the order of their instances' numbers (each instance's in
