@@ -17,6 +17,8 @@
 //!   buffer; on NVIDIA's driver 615.71.09 that `vkDestroyCommandPool` intermittently never returned
 //!   (the driver spinning, with its own `[vkrt] Analysis` thread), so the command buffer never
 //!   completed and its queue stalled.
+//!   x86Code RAM 5: a long-lived consumer's trim (`Device::trim_idle`, on its own thread) does
+//!   release idle spares, as only a release returns the driver's memory (`Spares::trim`).
 //! - **Descriptor pools are bounded.** At most [`DESCRIPTOR_POOLS`] descriptor pools of at most
 //!   [`DESCRIPTORS`] descriptors together; a descriptor pool given back past them releases the
 //!   oldest spares first, so the spares follow the shapes in use. The descriptors bound the
@@ -120,6 +122,10 @@ pub(super) const DESCRIPTORS: u64 = 1 << 18;
 /// ([`Spares::trim`]): a quiet compositor's frame takes a few.
 pub(super) const TRIM_KEEP: usize = 4;
 
+/// x86Code RAM 5: the most command buffers an idle spare among the newest keeps
+/// ([`Spares::trim`]); a compositor's frame of a few passes makes ~5 to 10.
+pub(super) const TRIM_KEEP_BUFFERS: usize = 32;
+
 /// The spare descriptor pools of each list a trim of a quiet device keeps ([`Spares::trim`]).
 pub(super) const TRIM_KEEP_DESCRIPTOR_POOLS: usize = 16;
 
@@ -210,6 +216,11 @@ impl CommandPool {
     }
 
     /// Whether the pool made no secondary command buffer (the module docs).
+    /// The command buffers it made, the primary begun ahead included.
+    fn buffers(&self) -> usize {
+        self.made[0].len() + self.made[1].len() + usize::from(self.begun.is_some())
+    }
+
     pub(super) fn wants_secondary(&self) -> bool {
         self.made[level_index(vk::CommandBufferLevel::SECONDARY)].is_empty()
     }
@@ -364,16 +375,37 @@ impl Spares {
         *lock(&self.last_given) = Some(std::time::Instant::now());
     }
 
-    /// x86Code RAM 2: give back the driver memory of the spare command pools no command buffer
-    /// took for `idle` (`vkResetCommandPool` with `RELEASE_RESOURCES`: the pool and its command
-    /// buffers stay, their recorded memory goes), keeping the newest [`TRIM_KEEP`] spares of each
-    /// family as they are; and, where no command buffer gave back anything for `idle`, release
-    /// the spare descriptor pools past [`TRIM_KEEP_DESCRIPTOR_POOLS`] of each list, oldest first.
-    /// The spares hold what their largest command buffer recorded, for good: on NVIDIA's
-    /// 615.78.08 its 2 MiB chunks of pinned system memory (a phone's compositor, after a few apps:
-    /// 24 chunks, 48 MiB, never given back). A trimmed pool goes to the oldest end, so takers take
-    /// the untrimmed first. Outside sections alone, as a taker's reset. Returns the command pools
-    /// trimmed and the descriptor pools released.
+    /// x86Code RAM 5: the spare command pools, the primaries and secondaries they made, and the
+    /// spare descriptor pools (both lists).
+    pub(super) fn counts(&self) -> (usize, usize, usize, usize) {
+        let pools = lock(&self.command_pools);
+        let made = |at: usize| {
+            pools
+                .iter()
+                .map(|p| p.made[at].len() + usize::from(at == 0 && p.begun.is_some()))
+                .sum()
+        };
+        let descriptors = lock(&self.descriptor_pools).len() + lock(&self.fitted_pools).len();
+        (pools.len(), made(0), made(1), descriptors)
+    }
+
+    /// x86Code RAM 2 / RAM 5: release the spare command pools no command buffer took for `idle`
+    /// past the newest [`TRIM_KEEP`] of each family, and those of the newest that hold more than
+    /// [`TRIM_KEEP_BUFFERS`] command buffers (`vkDestroyCommandPool`); and, where no command
+    /// buffer gave back anything for `idle`, release the spare descriptor pools past
+    /// [`TRIM_KEEP_DESCRIPTOR_POOLS`] of each list, oldest first. The spares hold what their
+    /// busiest command buffer made and recorded, for good: on NVIDIA's 615.78.08 its 2 MiB chunks
+    /// of pinned system memory (a phone's compositor, after a few apps: 24 chunks, 48 MiB) and
+    /// ~25 KiB of malloc per command buffer (10 spares held 1294 primaries, ~35 MiB, after five
+    /// apps; a frame of many passes made 130 in one pool). RAM 2 reset the pools with
+    /// `RELEASE_RESOURCES` instead, which gives back neither: measured (mtlvk's devprobe
+    /// `cbmalloc`, 1300 command buffers in 10 pools: malloc in use 7 -> 40 MiB), the reset and
+    /// `vkFreeCommandBuffers` + `vkTrimCommandPool` keep it (39, 38 MiB); only
+    /// `vkDestroyCommandPool` returns it (7 MiB). The release is on the caller's thread (the
+    /// consumer's trim thread), of a pool out of the spares that nothing pending uses: not on the
+    /// handler thread of a completing command buffer, where 615.71.09's destroy once spun (the
+    /// module docs). The next burst makes its pools anew. Outside sections alone. Returns the
+    /// command pools and the descriptor pools released.
     pub(super) fn trim(&self, device: &DeviceShared, idle: std::time::Duration) -> (usize, usize) {
         if exit_guard::in_section() {
             return (0, 0);
@@ -399,40 +431,17 @@ impl Spares {
                         1
                     }
                 };
-                if seen > TRIM_KEEP && stale(&pools[at]) {
+                let pool = &pools[at];
+                if stale(pool) && (seen > TRIM_KEEP || pool.buffers() > TRIM_KEEP_BUFFERS) {
                     taken.push(pools.remove(at));
                 }
             }
         }
-        let mut trimmed = 0;
-        let mut kept = Vec::with_capacity(taken.len());
-        for mut pool in taken {
+        let trimmed = taken.len();
+        for pool in taken {
             // SAFETY: the pool is out of the spares, this thread's alone, and nothing of it is
             // pending: a command buffer gave it back once its work ended.
-            let reset = unsafe {
-                device
-                    .vk()
-                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
-            };
-            if reset.is_err() {
-                // SAFETY: as above.
-                unsafe { release_in_section(device, pool.raw) };
-                continue;
-            }
-            // The reset left every command buffer of it, the primary begun ahead too, initial.
-            if let Some(buffer) = pool.begun.take() {
-                pool.made[level_index(vk::CommandBufferLevel::PRIMARY)].push(buffer);
-            }
-            pool.recording = false;
-            pool.given = None;
-            trimmed += 1;
-            kept.push(pool);
-        }
-        if !kept.is_empty() {
-            let mut pools = lock(&self.command_pools);
-            for pool in kept {
-                pools.insert(0, pool);
-            }
+            unsafe { release_in_section(device, pool.raw) };
         }
         let quiet = lock(&self.last_given).is_none_or(|at| now.duration_since(at) >= idle);
         let mut released = 0;

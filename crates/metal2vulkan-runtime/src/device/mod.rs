@@ -922,12 +922,21 @@ impl Device {
         &self.0
     }
 
+    /// x86Code RAM 5: the spare command pools, the primary and secondary command buffers they
+    /// hold, and the spare descriptor pools.
+    #[doc(hidden)]
+    pub fn spare_counts(&self) -> (usize, usize, usize, usize) {
+        self.0.spares.counts()
+    }
+
     /// x86Code RAM 2: give back what the device's spares hold past their use, for a long-lived
     /// consumer whose work comes in bursts (a phone's compositor): the driver memory of spare
     /// command pools no command buffer took for `idle`, and, where nothing was given back for
     /// `idle`, the spare descriptor pools past a few (`spares.rs`, `Spares::trim`). Costs the next
     /// burst the re-growth of what it needs (a pool's chunks, a descriptor pool's making). Returns
-    /// the command pools trimmed and the descriptor pools released. No Metal counterpart.
+    /// the command pools and the descriptor pools released (x86Code RAM 5: a spare command pool
+    /// is released, not reset, as only its release returns the driver's malloc). No Metal
+    /// counterpart.
     #[doc(hidden)]
     pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize) {
         self.0.spares.trim(&self.0, idle)
