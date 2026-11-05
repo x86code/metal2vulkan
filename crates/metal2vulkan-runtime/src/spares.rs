@@ -304,6 +304,13 @@ impl CommandPool {
     }
 }
 
+/// x86Code RAM 10: whether settled pools given back are reset with RELEASE_RESOURCES at once
+/// (METAL2VULKAN_POOL_RELEASE_ON_GIVE=0 = only when taken, as before).
+fn release_on_give() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("METAL2VULKAN_POOL_RELEASE_ON_GIVE").as_deref() != Ok("0"))
+}
+
 /// A descriptor pool, with the room it was made with.
 pub(super) struct DescriptorPool {
     pub(super) raw: vk::DescriptorPool,
@@ -382,6 +389,32 @@ impl Spares {
         settled: bool,
     ) {
         pool.recording = !settled;
+        if settled && release_on_give() && pool.buffers() > 0 {
+            // x86Code RAM 10: a settled pool given back is reset with RELEASE_RESOURCES at once, not
+            // when next taken. Its command buffers reused as they were (vkBeginCommandBuffer's implicit
+            // reset) keep the chunks their largest recording grew to, so every spare held its own high
+            // water while it waited, the next burst found the driver's cache empty, and NVIDIA mapped
+            // new 2 MB chunks it keeps for the instance's life (devprobe cbhigh: destroying the pools,
+            // the recording threads or even the VkDevice returns none; only vkDestroyInstance does).
+            // Released here, the waiting spares' chunks serve the next recordings.
+            // SAFETY: nothing of the pool is pending and none of its command buffers is recording
+            // (settled); the caller gives it up, so this thread is its only user.
+            let reset = exit_guard::enter().map(|_busy| unsafe {
+                device.vk().reset_command_pool(pool.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
+            });
+            if let Some(Err(_)) = reset {
+                // as the take's reset failure: the pool goes
+                // SAFETY: as above.
+                unsafe { release_in_section(device, pool.raw) };
+                return;
+            }
+            if reset.is_some() {
+                if let Some(buffer) = pool.begun.take() {
+                    pool.made[level_index(vk::CommandBufferLevel::PRIMARY)].push(buffer);
+                }
+                device.counts.spare_command_pool_reset();
+            }
+        }
         pool.given = Some(std::time::Instant::now());
         pool.stock(device);
         keep_command_pool(&mut lock(&self.command_pools), pool);

@@ -52,7 +52,7 @@
 //!   called as it is ([`exit_guard::called`]), so the first replay of a command the device's
 //!   priming could not make registers the exit hook again.
 
-mod handles;
+pub(crate) mod handles;
 mod log;
 mod replays;
 mod thunks;

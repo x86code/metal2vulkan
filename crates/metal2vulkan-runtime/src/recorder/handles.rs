@@ -31,6 +31,8 @@ struct Free {
     next: u32,
     /// Logs let go of, emptied, their room kept.
     logs: Vec<Kept>,
+    /// x86Code RAM 10: when a handle was last made ([`trim`]).
+    last_made: Option<std::time::Instant>,
 }
 
 /// A log kept for reuse in the box a handle's entry points to: a handle made takes it with no
@@ -41,7 +43,29 @@ static FREE: Mutex<Free> = Mutex::new(Free {
     indices: Vec::new(),
     next: 0,
     logs: Vec::new(),
+    last_made: None,
 });
+
+/// x86Code RAM 10: the logs [`trim`] leaves kept.
+const TRIM_KEEP_LOGS: usize = 16;
+
+/// x86Code RAM 10: where no handle was made for `idle`, let go of the kept logs past the
+/// [`TRIM_KEEP_LOGS`] reused first. Each keeps the room of its largest command buffer, and
+/// [`FREE`] keeps up to [`KEPT_LOGS`] of them: after a phone's run of apps, a window server's
+/// frames of many draws left ~45 MiB of arenas kept with nothing recording (mtlvk jemalloc
+/// profile, home -> after use). The next burst grows its logs again. Returns how many went.
+pub(crate) fn trim(idle: std::time::Duration) -> usize {
+    let gone: Vec<Kept> = {
+        let mut free = lock(&FREE);
+        if free.last_made.is_none_or(|at| at.elapsed() < idle) {
+            return 0;
+        }
+        let n = free.logs.len().saturating_sub(TRIM_KEEP_LOGS);
+        // the newest are popped first: keep those
+        free.logs.drain(..n).collect()
+    };
+    gone.len()
+}
 
 /// The most logs [`FREE`] keeps for reuse.
 const KEPT_LOGS: usize = 1024;
@@ -131,6 +155,7 @@ pub(super) fn make(level: vk::CommandBufferLevel, replays: &Arc<Replays>) -> Opt
             }
             None => return None,
         };
+        free.last_made = Some(std::time::Instant::now());
         (index, free.logs.pop())
     };
     let mut log = match kept {

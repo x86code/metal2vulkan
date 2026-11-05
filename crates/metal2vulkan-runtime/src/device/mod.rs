@@ -959,7 +959,10 @@ impl Device {
     /// counterpart.
     #[doc(hidden)]
     pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize) {
-        self.0.spares.trim(&self.0, idle)
+        let (pools, descriptors) = self.0.spares.trim(&self.0, idle);
+        // x86Code RAM 10: and the recorder's kept logs past a few (`recorder/handles.rs`, `trim`),
+        // counted with the command pools
+        (pools + crate::recorder::handles::trim(idle), descriptors)
     }
 
     /// Keep room in the memory pools the runtime's encodings and commits place their own
